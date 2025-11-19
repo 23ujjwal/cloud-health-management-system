@@ -1,0 +1,16 @@
+# render.yaml - Streamlit app on Render (Python)
+services:
+  - type: web
+    name: cloud-health-management-system
+    env: python
+    plan: free
+    branch: main
+    region: oregon
+    buildCommand: >
+      pip install --upgrade pip &&
+      pip install -r requirements.txt
+    startCommand: >
+      streamlit run cloud.py --server.port $PORT --server.headless true
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
