@@ -18,6 +18,7 @@ from bson import ObjectId
 from bson.json_util import dumps as bson_dumps
 import pymongo
 import gridfs
+import certifi   # <-- ensure certifi is installed and imported
 
 # Try helper module first
 try:
@@ -27,7 +28,15 @@ except Exception:
     MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "health_management")
     if not MONGO_URI:
         raise RuntimeError("MONGO_URI is not set. Please add it to .env.")
-    client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
+    # Create MongoClient forcing certifi CA bundle and explicit TLS options
+    # This helps avoid SSL/TLS handshake errors on some cloud hosts (Render, etc.)
+    client = pymongo.MongoClient(
+        MONGO_URI,
+        tls=True,
+        tlsCAFile=certifi.where(),
+        serverSelectionTimeoutMS=10000,
+        connectTimeoutMS=10000
+    )
     db = client[MONGO_DB_NAME]
     users_coll = db['users']
     patients_coll = db['patients']
@@ -129,6 +138,7 @@ def get_report_file(file_id):
         return None, None
 
 # ---------- END: MongoDB adapter ----------
+
 
 # ==============================
 # THEME & STYLES
