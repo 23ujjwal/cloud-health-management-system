@@ -531,16 +531,105 @@ def get_triage_df():
     df = pd.DataFrame(rows)
     return df
 
-def create_appointment(patient_id: int, doctor_id: int, meeting_iso: str, note: str):
-    doc = {
-        "patient_id": str(patient_id),
-        "doctor_id": str(doctor_id),
-        "meeting_at": meeting_iso,
-        "note": note,
-        "created_at": datetime.utcnow()
-    }
-    res = appointments_coll.insert_one(doc)
-    return str(res.inserted_id)
+def create_appointment(patient_id, doctor_id, meeting_iso=None, when_dt=None, note=None, notes=None):
+    """
+    Create an appointment in MongoDB (appointments_coll) or fallback to SQLite if Mongo not available.
+    Accepts flexible args:
+      - when_dt: a datetime.datetime object (preferred)
+      - meeting_iso: ISO datetime string (fallback)
+      - note or notes: free text
+    Returns: inserted id (str) or None on failure.
+    """
+    # choose note value
+    note_val = notes if notes is not None else note
+
+    # normalize meeting datetime to a Python datetime if possible
+    meeting_dt = None
+    if when_dt is not None:
+        meeting_dt = when_dt
+    elif meeting_iso:
+        try:
+            if isinstance(meeting_iso, str):
+                # try common ISO parse
+                meeting_dt = datetime.fromisoformat(meeting_iso)
+            elif isinstance(meeting_iso, (int, float)):
+                # unix timestamp
+                meeting_dt = datetime.fromtimestamp(meeting_iso)
+        except Exception:
+            meeting_dt = None
+
+    # Helper: normalize id into ObjectId / int / str depending on format
+    def _norm_id_for_storage(x):
+        if x is None:
+            return None
+        # if already ObjectId
+        if isinstance(x, ObjectId):
+            return x
+        # if numeric
+        if isinstance(x, int):
+            return x
+        # string: check ObjectId-like
+        if isinstance(x, str):
+            if ObjectId.is_valid(x):
+                try:
+                    return ObjectId(x)
+                except Exception:
+                    pass
+            # numeric string -> int
+            if x.isdigit():
+                try:
+                    return int(x)
+                except Exception:
+                    pass
+            return x
+        # fallback to string
+        return str(x)
+
+    # If Mongo collections exist, insert into Mongo
+    try:
+        if 'appointments_coll' in globals() and appointments_coll is not None:
+            doc = {
+                "patient_id": _norm_id_for_storage(patient_id),
+                "doctor_id": _norm_id_for_storage(doctor_id),
+                "created_at": datetime.utcnow()
+            }
+            # store ISO/datetime field under "when" for Mongo
+            if meeting_dt is not None:
+                doc["when"] = meeting_dt
+            elif meeting_iso:
+                doc["when"] = meeting_iso
+
+            if note_val:
+                doc["notes"] = note_val
+
+            res = appointments_coll.insert_one(doc)
+            return str(res.inserted_id)
+    except Exception:
+        # If Mongo insert fails, we'll try SQLite fallback below
+        pass
+
+    # Fallback to SQLite (keep original behavior)
+    try:
+        conn = sqlite3.connect(DB)
+        c = conn.cursor()
+        # meeting_at stored as ISO string in sqlite
+        meeting_iso_str = None
+        if meeting_dt is not None:
+            meeting_iso_str = meeting_dt.isoformat()
+        elif meeting_iso:
+            meeting_iso_str = meeting_iso if isinstance(meeting_iso, str) else str(meeting_iso)
+
+        c.execute("""INSERT INTO appointments(patient_id, doctor_id, meeting_at, note)
+                     VALUES(?,?,?,?)""",
+                  (str(patient_id), str(doctor_id), meeting_iso_str, note_val))
+        conn.commit()
+        rowid = c.lastrowid
+        conn.close()
+        return rowid
+    except Exception:
+        # Could not insert anywhere
+        return None
+
 
 def get_patient_appointments(patient_id: int) -> pd.DataFrame:
     rows = []
