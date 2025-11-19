@@ -84,6 +84,128 @@ def serialize_doc(doc):
         else:
             out[k] = v
     return out
+def get_latest_triage_per_patient() -> pd.DataFrame:
+    """
+    Return a pandas DataFrame containing the latest triage record per patient.
+    Works with MongoDB triage_records (triage_coll) and patients_coll.
+    Columns: patient_id, recommended_specialty, severity, created_at, full_name, age, gender
+    """
+    try:
+        # Aggregate latest triage per patient using Mongo aggregation
+        pipeline = [
+            {"$sort": {"created_at": -1}},
+            {"$group": {
+                "_id": "$patient_id",
+                "doc": {"$first": "$$ROOT"}   # take newest per patient
+            }},
+            {"$replaceRoot": {"newRoot": "$doc"}},
+            {"$project": {
+                "_id": 0,
+                "patient_id": 1,
+                "recommended_specialty": 1,
+                "severity": 1,
+                "created_at": 1,
+                "selected_symptoms": 1,
+                "top_conditions": 1,
+                "note": 1
+            }}
+        ]
+        cursor = triage_coll.aggregate(pipeline, allowDiskUse=True)
+        rows = list(cursor)
+        if not rows:
+            return pd.DataFrame()
+
+        # Normalize patient ids to strings for joining
+        for r in rows:
+            # keep patient id as string for consistent handling in DataFrame
+            pid = r.get("patient_id")
+            if isinstance(pid, ObjectId):
+                r["patient_id"] = str(pid)
+            else:
+                r["patient_id"] = str(pid) if pid is not None else None
+
+            # make sure created_at is a python datetime (serialize_doc will convert later if needed)
+            ca = r.get("created_at")
+            # if it's a Mongo date object it will be OK; otherwise leave it for pandas to parse
+            r["created_at"] = ca
+
+        df = pd.DataFrame(rows)
+
+        # If for some rows patient_id is missing, drop them
+        if "patient_id" not in df.columns or df["patient_id"].isnull().all():
+            return pd.DataFrame()
+
+        # Fetch patient metadata in one query for all patient_ids
+        patient_ids = list(df["patient_id"].dropna().unique())
+        # Build query to match numeric or ObjectId or string forms if needed.
+        # We'll query by string-form patient id stored in patients_coll as either 'id' or '_id'
+        patients_map = {}
+        # Try to find patients whose _id matches ObjectId or whose id field matches numeric
+        # Build two query sets: ObjectId candidates and string candidates
+        obj_ids = [ObjectId(pid) for pid in patient_ids if ObjectId.is_valid(pid)]
+        str_ids = [pid for pid in patient_ids if not ObjectId.is_valid(pid)]
+
+        q_or = []
+        if obj_ids:
+            q_or.append({"_id": {"$in": obj_ids}})
+        if str_ids:
+            # maybe patients store patient id in 'id' numeric field or in string '_id' forms
+            q_or.append({"_id": {"$in": [ObjectId(s) for s in str_ids if ObjectId.is_valid(s)]}})
+            q_or.append({"id": {"$in": [int(s) for s in str_ids if s.isdigit()]}})
+            q_or.append({"user_id": {"$in": str_ids}})
+
+        if q_or:
+            pat_cursor = patients_coll.find({"$or": q_or}) if len(q_or) > 1 else patients_coll.find(q_or[0])
+        else:
+            pat_cursor = patients_coll.find({})
+
+        for p in pat_cursor:
+            pid_key = None
+            # prefer string _id if present
+            try:
+                pid_key = str(p.get("_id")) if p.get("_id") is not None else None
+            except Exception:
+                pid_key = None
+            if not pid_key and "id" in p:
+                pid_key = str(p.get("id"))
+            # fallback to user_id
+            if not pid_key and "user_id" in p:
+                pid_key = str(p.get("user_id"))
+            if pid_key:
+                patients_map[pid_key] = {
+                    "full_name": p.get("full_name") or p.get("name") or p.get("fullName"),
+                    "age": p.get("age"),
+                    "gender": p.get("gender")
+                }
+
+        # Map patient metadata onto df
+        df["patient_id"] = df["patient_id"].astype(str)
+        df["full_name"] = df["patient_id"].apply(lambda x: patients_map.get(x, {}).get("full_name"))
+        df["age"] = df["patient_id"].apply(lambda x: patients_map.get(x, {}).get("age"))
+        df["gender"] = df["patient_id"].apply(lambda x: patients_map.get(x, {}).get("gender"))
+
+        # Convert created_at to pandas datetime for sorting & compatibility
+        if "created_at" in df.columns:
+            try:
+                df["created_at"] = pd.to_datetime(df["created_at"])
+            except Exception:
+                # if conversion fails, leave as-is
+                pass
+
+        # Ensure columns order expected by UI
+        wanted_cols = ["patient_id", "recommended_specialty", "severity", "created_at", "full_name", "age", "gender", "selected_symptoms", "top_conditions", "note"]
+        existing = [c for c in wanted_cols if c in df.columns]
+        df = df[existing]
+
+        # sort by created_at desc
+        if "created_at" in df.columns:
+            df = df.sort_values("created_at", ascending=False).reset_index(drop=True)
+
+        return df
+
+    except Exception:
+        # on error, return empty DataFrame rather than crashing the UI
+        return pd.DataFrame()
 
 # Init DB (create indexes)
 def init_db():
