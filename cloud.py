@@ -1078,37 +1078,115 @@ def patient_chat_ui(assigned_doctor_name: str):
         st.info("Click **Start New Chat** above to begin a conversation.")
 
 def patient_dashboard():
+    """
+    Robust patient dashboard supporting both SQLite tuple rows and Mongo dict rows.
+    Handles report upload (GridFS), listing, preview (images), and download.
+    """
     row = get_patient_by_user_id(st.session_state.user_id)
     if not row:
         st.info("No patient profile found. Please register.")
         return
-    patient_id = row[0]
+
+    # helpers to safely extract fields from tuple (sqlite) or dict (mongo)
+    def _get_field(r, idx_or_key, fallback=None):
+        try:
+            if isinstance(r, dict):
+                return r.get(idx_or_key, fallback)
+            else:
+                # tuple-like
+                return r[idx_or_key] if idx_or_key < len(r) else fallback
+        except Exception:
+            return fallback
+
+    # determine patient_id (prefer stable string form)
+    if isinstance(row, dict):
+        # prefer string _id if present
+        pid = row.get("_id") or row.get("id") or row.get("patient_id")
+        patient_name = row.get("full_name") or row.get("name") or row.get("fullName")
+    else:
+        # sqlite tuple layout: (id, user_id, full_name, age, gender, phone, email, address)
+        try:
+            pid = row[0]
+            patient_name = row[2]
+        except Exception:
+            pid = row[0] if len(row) > 0 else None
+            patient_name = row[2] if len(row) > 2 else None
+
+    # Normalize patient id to string for use in Mongo queries / storage keys
+    patient_id = str(pid) if pid is not None else None
+
     st.markdown(f"### 🏥 Patient Dashboard — <span class='pill'>Secure</span>", unsafe_allow_html=True)
-    st.write(f"Hello, **{row[2]}**!")
+    st.write(f"Hello, **{patient_name or 'Patient'}**!")
+
+    # Profile box
     with st.expander("👤 My Profile", expanded=False):
+        age = _get_field(row, 3, "-")
+        gender = _get_field(row, 4, "-")
+        phone = _get_field(row, 5, "-")
+        email = _get_field(row, 6, "-")
+        address = _get_field(row, 7, "-")
         c1, c2, c3 = st.columns(3)
-        c1.metric("Age", row[3] or "-")
-        c2.metric("Gender", row[4] or "-")
-        c3.metric("Phone", row[5] or "-")
-        st.caption(f"Email: {row[6] or '-'}  |  Address: {row[7] or '-'}")
+        c1.metric("Age", age or "-")
+        c2.metric("Gender", gender or "-")
+        c3.metric("Phone", phone or "-")
+        st.caption(f"Email: {email or '-'}  |  Address: {address or '-'}")
 
     st.divider()
-    # Assigned doctor & Date of Approval (latest appointment) — dd/mm/yy HH:MM
+
+    # Assigned doctor & Date of Approval (latest appointment)
     st.subheader("✅ Doctor Approval")
     latest = get_latest_appointment(patient_id)
     assigned_doctor_name = None
     if latest:
-        meet_at = latest[1]
-        assigned_doctor_name = latest[4]
-        st.success(f"Doctor **{latest[4]}** ({latest[5]}) at **{latest[6]}**")
-        try:
-            meet_dt = datetime.fromisoformat(meet_at)
-            st.write(f"**Date of Approval / Meeting:** {meet_dt.strftime('%d/%m/%y %H:%M')}")
-        except Exception:
-            st.write(f"Meeting at: {meet_at}")
+        # If dict (mongo) or tuple (sqlite)
+        if isinstance(latest, dict):
+            meet_val = latest.get("when") or latest.get("meeting_at") or latest.get("meetingAt") or latest.get("meeting_at_iso")
+            assigned_doctor_name = latest.get("doctor_name") or latest.get("doctor") or latest.get("doctor_full_name")
+            doc_spec = latest.get("doctor_specialization") or latest.get("specialization")
+            note = latest.get("notes") or latest.get("note")
+        else:
+            # tuple-like legacy: (id, meeting_at, note, created_at, doctor_name, specialization, hospital_clinic)
+            try:
+                meet_val = latest[1]
+                note = latest[2] if len(latest) > 2 else None
+                assigned_doctor_name = latest[4] if len(latest) > 4 else None
+                doc_spec = latest[5] if len(latest) > 5 else None
+            except Exception:
+                meet_val = None
+                note = None
+                assigned_doctor_name = None
+                doc_spec = None
+
+        # parse meeting datetime robustly
+        meet_dt = None
+        if isinstance(meet_val, str):
+            try:
+                meet_dt = datetime.fromisoformat(meet_val)
+            except Exception:
+                try:
+                    meet_dt = pd.to_datetime(meet_val)
+                    if hasattr(meet_dt, "to_pydatetime"):
+                        meet_dt = meet_dt.to_pydatetime()
+                except Exception:
+                    meet_dt = None
+        elif isinstance(meet_val, datetime):
+            meet_dt = meet_val
+
+        if meet_dt:
+            st.success(f"Doctor **{assigned_doctor_name or '-'}** ({doc_spec or '-'}) at **{meet_dt.strftime('%d/%m/%y %H:%M')}**")
+            if note:
+                st.caption(f"Note: {note}")
+        else:
+            if assigned_doctor_name:
+                st.success(f"Doctor **{assigned_doctor_name}** ({doc_spec or '-'})")
+                if note:
+                    st.caption(f"Note: {note}")
+            else:
+                st.info("No doctor assigned yet. Once a doctor approves and schedules a meeting, it will appear here.")
     else:
         st.info("No doctor assigned yet. Once a doctor approves and schedules a meeting, it will appear here.")
 
+    # Chat area if doctor assigned
     if assigned_doctor_name:
         st.markdown(" ")
         patient_chat_ui(assigned_doctor_name)
@@ -1121,24 +1199,28 @@ def patient_dashboard():
     appts = get_patient_appointments(patient_id)
     if not appts.empty:
         appts_display = appts.copy()
-        if 'meeting_at' in appts_display.columns:
+        if "meeting_at" in appts_display.columns:
             try:
                 appts_display["meeting_at"] = pd.to_datetime(appts_display["meeting_at"]).dt.strftime("%d/%m/%y %H:%M")
             except Exception:
                 pass
-        if 'created_at' in appts_display.columns:
+        if "created_at" in appts_display.columns:
             try:
                 appts_display["created_at"] = pd.to_datetime(appts_display["created_at"]).dt.strftime("%d/%m/%y %H:%M")
             except Exception:
                 pass
-        st.dataframe(appts_display.rename(columns={
-            "meeting_at":"Meeting At (dd/mm/yy)",
-            "doctor_name":"Doctor",
-            "specialization":"Specialty",
-            "hospital_clinic":"Hospital/Clinic",
-            "note":"Note",
-            "created_at":"Created"
-        }), use_container_width=True, hide_index=True)
+        st.dataframe(
+            appts_display.rename(columns={
+                "meeting_at": "Meeting At (dd/mm/yy)",
+                "doctor_name": "Doctor",
+                "specialization": "Specialty",
+                "hospital_clinic": "Hospital/Clinic",
+                "note": "Note",
+                "created_at": "Created"
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
     else:
         st.caption("No appointments yet.")
 
@@ -1148,7 +1230,7 @@ def patient_dashboard():
         symptoms = st.text_area("Notes", placeholder="Anything else you'd like your doctor to know…", height=100)
         duration = st.text_input("Duration", placeholder="e.g., 3 days, 2 weeks (optional)")
         previous_diagnosis = st.text_area("Previous Diagnosis (optional)", placeholder="Any past diagnosis…")
-        c1, c2 = st.columns([1,1])
+        c1, c2 = st.columns([1, 1])
         with c1:
             submitted = st.form_submit_button("Save Note", use_container_width=True)
         with c2:
@@ -1161,61 +1243,78 @@ def patient_dashboard():
         else:
             st.error("Please write something in Notes before saving.")
     if exit_btn:
-        st.session_state.logged_in = False
-        st.session_state.user_role = None
-        st.session_state.user_id = None
-        st.session_state.page = 'main'
-        st.session_state.chat_messages = []
-        st.session_state.show_chat = False
-        st.toast("Logged out", icon="👋")
-        st.rerun()
+        logout_reset()
 
     # ----- Upload Reports UI -----
     st.divider()
     st.subheader("📎 Upload Medical Report")
     with st.form("upload_report_form", clear_on_submit=True):
-        uploaded_file = st.file_uploader("Upload report (PDF, image). Max 10MB", type=["pdf","png","jpg","jpeg"], key="report_upload")
+        uploaded_file = st.file_uploader("Upload report (PDF, image). Max 10MB", type=["pdf", "png", "jpg", "jpeg"], key="report_upload")
         submit_report = st.form_submit_button("Upload Report")
     if submit_report:
         if uploaded_file is not None:
             try:
                 data = uploaded_file.read()
-                if len(data) > 10 * 1024 * 1024:
+                # safe size check (10 MB)
+                max_bytes = 10 * 1024 * 1024
+                if len(data) > max_bytes:
                     st.error("File too large. Max 10 MB.")
                 else:
-                    fid = upload_report(data, uploaded_file.name, uploaded_file.type, str(patient_id), st.session_state.user_id)
-                    st.success("Report uploaded. File id: " + fid)
+                    # upload_report should accept patient_id (string) and uploader id
+                    fid = upload_report(data, uploaded_file.name, uploaded_file.type, patient_id, st.session_state.user_id)
+                    st.success("Report uploaded. File id: " + str(fid))
+                    # force a rerun to refresh listing
+                    st.experimental_rerun()
             except Exception as e:
                 print("DEBUG upload exception:", repr(e))
                 st.error("Upload failed.")
         else:
             st.error("Please select a file to upload.")
+
+    # List uploaded reports
     st.markdown("**Uploaded reports for this patient:**")
-    total_reports = count_reports_for_patient(str(patient_id))
+    try:
+        total_reports = count_reports_for_patient(patient_id)
+    except Exception:
+        total_reports = 0
+
     per_page = 5
-    page = st.number_input("Page", min_value=1, value=1, step=1)
-    skip = (page-1)*per_page
-    reports = list_reports_for_patient(str(patient_id), limit=per_page, skip=skip)
+    page = st.number_input("Page", min_value=1, value=1, step=1, key="reports_page")
+    skip = (page - 1) * per_page
+    reports = list_reports_for_patient(patient_id, limit=per_page, skip=skip)
+
     if reports:
         for r in reports:
-            fname = r.get('filename')
-            uploaded_at = r.get('uploaded_at')
-            ftype = r.get('content_type') or ''
-            st.write(f"- {fname} — uploaded at {uploaded_at}")
-            if ftype.startswith("image/"):
-                data, meta = get_report_file(r.get('file_id'))
+            fname = r.get("filename") or "unknown"
+            uploaded_at = r.get("uploaded_at")
+            ftype = (r.get("content_type") or "").lower()
+            # show basic info
+            colA, colB = st.columns([6, 1])
+            with colA:
+                st.write(f"**{fname}** — uploaded at {uploaded_at}")
+            with colB:
+                # unique key per file for buttons
+                dl_key = f"dl_{str(r.get('file_id'))}_{page}"
+                # Fetch file bytes (could be heavy — fetch on demand right before download)
+                data, meta = get_report_file(r.get("file_id"))
                 if data:
+                    # If image — preview inline
+                    if ftype.startswith("image/"):
+                        try:
+                            st.image(data, caption=fname, use_column_width=True)
+                        except Exception:
+                            st.write("(Image preview failed)")
+                    # Provide direct download button (Streamlit will stream the bytes)
                     try:
-                        st.image(data, caption=fname, use_column_width=True)
+                        st.download_button(label="Download", data=data, file_name=fname, mime=meta.get("content_type"), key=dl_key)
                     except Exception:
-                        st.write("(Image preview failed)")
-            if st.button(f"Download {fname}", key=str(r.get('_id'))):
-                data, meta = get_report_file(r.get('file_id'))
-                if data:
-                    st.download_button(label=f"Download {fname}", data=data, file_name=fname, mime=meta.get('content_type'))
+                        st.button("Download (prepare)", key=dl_key + "_btn")
                 else:
-                    st.error('Could not fetch file from storage.')
-        st.write(f"Showing page {page} — {min(total_reports, skip+1)} to {min(total_reports, skip+per_page)} of {total_reports}")
+                    st.error("Could not fetch file from storage.")
+        # show page info
+        start_num = skip + 1
+        end_num = min(total_reports, skip + len(reports))
+        st.write(f"Showing page {page} — {start_num} to {end_num} of {total_reports}")
     else:
         st.caption("No reports uploaded yet for this patient.")
 
