@@ -1108,26 +1108,25 @@ def doctor_dashboard():
         routed = pd.DataFrame()
 
     # ---------- FIXED _is_taken FUNCTION ----------
- if not routed.empty:
+    if not routed.empty:
 
-    def _is_taken(pid):
-        """
-        Check if the patient already has an appointment with a doctor
-        of the same specialty.
-        """
-        try:
-            return patient_taken_by_specialty(pid, doctor_spec)
-        except Exception:
-            return False
+        def _is_taken(pid):
+            """
+            Check if the patient already has an appointment with a doctor
+            of the same specialty.
+            """
+            try:
+                return patient_taken_by_specialty(pid, doctor_spec)
+            except Exception:
+                return False
 
-    routed["taken_same_spec"] = routed["patient_id"].apply(_is_taken)
-    triage_for_me = routed[~routed["taken_same_spec"]].drop(columns=["taken_same_spec"]).copy()
-    hidden_count = int(routed["taken_same_spec"].sum())
+        routed["taken_same_spec"] = routed["patient_id"].apply(_is_taken)
+        triage_for_me = routed[~routed["taken_same_spec"]].drop(columns=["taken_same_spec"]).copy()
+        hidden_count = int(routed["taken_same_spec"].sum())
 
-else:
-    triage_for_me = pd.DataFrame()
-    hidden_count = 0
-
+    else:
+        triage_for_me = pd.DataFrame()
+        hidden_count = 0
 
     # UI section
     st.subheader("🧭 Triage (patients routed to you)")
@@ -1225,8 +1224,6 @@ else:
         )
     else:
         st.caption("No notes for your routed patients yet.")
-
-
 # ==============================
 # MAIN & SESSION
 # ==============================
