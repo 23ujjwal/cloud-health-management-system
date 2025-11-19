@@ -448,56 +448,8 @@ def get_patient_appointments(patient_id: int) -> pd.DataFrame:
 
 # Helper: try to convert an id-like value into ObjectId or int when possible
 # Helper: try to convert an id-like value into ObjectId or int when possible
-def _normalize_id_for_query(val):
-    """
-    Return a value suitable for querying Mongo:
-    - If it's an ObjectId string -> ObjectId(...)
-    - If it's an int or numeric string -> int(...)
-    - Otherwise return str(val)
-    """
-    if val is None:
-        return None
-    if isinstance(val, ObjectId):
-        return val
-    if isinstance(val, str):
-        if ObjectId.is_valid(val):
-            try:
-                return ObjectId(val)
-            except Exception:
-                pass
-        if val.isdigit():
-            try:
-                return int(val)
-            except Exception:
-                pass
-        return val
-    if isinstance(val, (int,)):
-        return val
-    return str(val)
 
 
-def get_latest_appointment(patient_id):
-    """
-    Returns the latest appointment document (serialized) for the given patient_id.
-    Works whether patient_id is an ObjectId string, ObjectId, numeric id or string id.
-    """
-    norm = _normalize_id_for_query(patient_id)
-
-    # Try querying by possible stored forms:
-    query_variants = []
-    if norm is not None:
-        query_variants.append({"patient_id": norm})
-    query_variants.append({"patient_id": str(patient_id)})
-    # If numeric string converted to int, already handled above
-
-    appt = None
-    for q in query_variants:
-        appt = appointments_coll.find_one(q, sort=[("when", -1)]) or appointments_coll.find_one(q, sort=[("meeting_at", -1)])
-        if appt:
-            break
-
-    if not appt:
-        return None
 
     # enrich appointment with doctor info where possible
     doc_id = appt.get("doctor_id")
@@ -515,42 +467,121 @@ def get_latest_appointment(patient_id):
     return out
 
 
+# ---------------------------------------------------------
+# FIXED HELPERS FOR MONGO IDs (ObjectId / int / string)
+# ---------------------------------------------------------
+
+# ----------------------------
+# Robust appointment helpers
+# ----------------------------
+def _normalize_id_for_query(val):
+    """Normalize id for queries: returns ObjectId, int, or string as appropriate."""
+    if val is None:
+        return None
+    if isinstance(val, ObjectId):
+        return val
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str):
+        # ObjectId-like hex
+        if ObjectId.is_valid(val):
+            try:
+                return ObjectId(val)
+            except Exception:
+                pass
+        # numeric string
+        if val.isdigit():
+            try:
+                return int(val)
+            except Exception:
+                pass
+        return val
+    return str(val)
+
+
+def get_latest_appointment(patient_id):
+    """
+    Return the latest appointment document (serialized dict) for the given patient_id.
+    Works when patient_id is ObjectId / ObjectId-string / int / numeric-string.
+    """
+    norm = _normalize_id_for_query(patient_id)
+
+    # try multiple variants (stored data may use different types)
+    queries = []
+    if norm is not None:
+        queries.append({"patient_id": norm})
+    # string form
+    queries.append({"patient_id": str(patient_id)})
+
+    appt = None
+    for q in queries:
+        appt = (
+            appointments_coll.find_one(q, sort=[("when", -1)]) or
+            appointments_coll.find_one(q, sort=[("meeting_at", -1)])
+        )
+        if appt:
+            break
+
+    if not appt:
+        return None
+
+    out = serialize_doc(appt)
+
+    # attach doctor info if possible
+    doc_id = appt.get("doctor_id")
+    if doc_id is not None:
+        dnorm = _normalize_id_for_query(doc_id)
+        doctor = (
+            doctors_coll.find_one({"_id": dnorm}) or
+            doctors_coll.find_one({"id": dnorm}) or
+            doctors_coll.find_one({"user_id": dnorm}) or
+            doctors_coll.find_one({"_id": _normalize_id_for_query(str(doc_id))})
+        )
+        if doctor:
+            out["doctor_name"] = doctor.get("full_name") or doctor.get("name")
+            out["doctor_specialization"] = doctor.get("specialization") or doctor.get("speciality") or doctor.get("specialty")
+    return out
+
+
 def patient_taken_by_specialty(patient_id, specialty) -> bool:
     """
-    Returns True if the patient's latest appointment is with a doctor
+    Returns True when this patient's latest appointment is with a doctor
     whose specialization matches `specialty` (case-insensitive substring tolerant).
-    Works with ObjectId/string/int patient ids stored in Mongo.
+    Accepts mixed id types (ObjectId/string/int).
     """
     if not specialty:
         return False
-
     latest = get_latest_appointment(patient_id)
     if not latest:
         return False
 
-    # get specialization from doctor details if present
-    doc_spec = None
-    if "doctor_specialization" in latest and latest["doctor_specialization"]:
-        doc_spec = latest["doctor_specialization"]
-    else:
-        # attempt to find doctor from raw appointment doc
+    # prefer attached doctor_specialization if present
+    doc_spec = (latest.get("doctor_specialization") or "").strip()
+    if not doc_spec:
+        # attempt to find doctor via raw appointment doc
         try:
             raw_appt = appointments_coll.find_one({"_id": _normalize_id_for_query(latest.get("_id"))})
             if raw_appt:
                 d_id = raw_appt.get("doctor_id")
                 if d_id is not None:
-                    d_normal = _normalize_id_for_query(d_id)
-                    doctor = doctors_coll.find_one({"_id": d_normal}) or doctors_coll.find_one({"id": d_normal}) or doctors_coll.find_one({"user_id": d_normal}) or doctors_coll.find_one({"_id": _normalize_id_for_query(str(d_id))})
+                    dnorm = _normalize_id_for_query(d_id)
+                    doctor = (
+                        doctors_coll.find_one({"_id": dnorm}) or
+                        doctors_coll.find_one({"id": dnorm}) or
+                        doctors_coll.find_one({"user_id": dnorm})
+                    )
                     if doctor:
-                        doc_spec = doctor.get("specialization") or doctor.get("speciality") or doctor.get("specialty")
+                        doc_spec = (doctor.get("specialization") or doctor.get("speciality") or doctor.get("specialty") or "").strip()
         except Exception:
-            doc_spec = None
+            doc_spec = ""
 
-    latest_spec = (doc_spec or "").strip().lower()
+    latest_spec = (doc_spec or "").lower()
     my_spec = (specialty or "").strip().lower()
     if not latest_spec or not my_spec:
         return False
     return (my_spec in latest_spec) or (latest_spec in my_spec)
+
+
 
 def add_note(patient_id, doctor_id, note):
     doc = {
@@ -1010,14 +1041,17 @@ def doctor_registration():
 
 def doctor_login():
     st.subheader("🔐 Doctor Login")
+
     with st.form("doctor_login_form"):
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
+
         c1, c2 = st.columns(2)
         with c1:
             submitted = st.form_submit_button("Login", use_container_width=True)
         with c2:
             back = st.form_submit_button("Back", use_container_width=True)
+
     if submitted:
         user_id = verify_user(username, password, "doctor")
         if user_id:
@@ -1028,20 +1062,29 @@ def doctor_login():
             st.rerun()
         else:
             st.error("Invalid credentials!")
+
     if back:
         st.session_state.page = 'main'
         st.rerun()
+
 
 def doctor_dashboard():
     drow = get_doctor_by_user_id(st.session_state.user_id)
     if not drow:
         st.info("No doctor profile found. Please register.")
         return
-    doctor_id = drow[0]
-    doctor_spec = (drow[3] or "").strip()
-    st.markdown(f"### 👨‍⚕️ Doctor Dashboard — <span class='pill'>{doctor_spec}</span>", unsafe_allow_html=True)
-    st.write(f"Welcome, **Dr. {drow[2]}** ({doctor_spec})")
-    c1, _ = st.columns([1,3])
+
+    doctor_id = drow["id"] if isinstance(drow, dict) else drow[0]
+    doctor_spec = (drow.get("specialization") if isinstance(drow, dict) else drow[3] or "").strip()
+
+    st.markdown(
+        f"### 👨‍⚕️ Doctor Dashboard — <span class='pill'>{doctor_spec}</span>",
+        unsafe_allow_html=True
+    )
+    st.write(f"Welcome, **Dr. {drow.get('full_name') if isinstance(drow, dict) else drow[2]}** ({doctor_spec})")
+
+    # Logout button
+    c1, _ = st.columns([1, 3])
     with c1:
         if st.button("🚪 Logout", use_container_width=True):
             st.session_state.logged_in = False
@@ -1049,23 +1092,35 @@ def doctor_dashboard():
             st.session_state.user_id = None
             st.toast("Logged out", icon="👋")
             st.rerun()
+
     st.divider()
 
-    latest_triage = get_triage_df()
+    # Load triage
+    latest_triage = get_latest_triage_per_patient()
+
     if not latest_triage.empty and doctor_spec:
-        routed = latest_triage[ latest_triage["recommended_specialty"].str.contains(doctor_spec, case=False, na=False) ].copy()
+        routed = latest_triage[
+            latest_triage["recommended_specialty"].str.contains(
+                doctor_spec, case=False, na=False
+            )
+        ].copy()
     else:
         routed = pd.DataFrame()
 
-    if not routed.empty:
-        def _is_taken(pid) -> bool:
-    # pid may be an ObjectId string, ObjectId, int or plain string.
-    # Do NOT convert to int unconditionally.
+    # ---------- FIXED _is_taken FUNCTION ----------
+  def _is_taken(pid):
+    """
+    pid can be ObjectId, ObjectId-string, numeric, or string.
+    Do NOT convert to int here; let the robust helper handle it.
+    """
     try:
         return patient_taken_by_specialty(pid, doctor_spec)
     except Exception:
-        # safe fallback: treat as not taken if anything goes wrong
         return False
+
+
+    # Apply filter for already assigned patients
+    if not routed.empty:
         routed["taken_same_spec"] = routed["patient_id"].apply(_is_taken)
         triage_for_me = routed[~routed["taken_same_spec"]].drop(columns=["taken_same_spec"]).copy()
         hidden_count = int(routed["taken_same_spec"].sum())
@@ -1073,57 +1128,94 @@ def doctor_dashboard():
         triage_for_me = pd.DataFrame()
         hidden_count = 0
 
+    # UI section
     st.subheader("🧭 Triage (patients routed to you)")
+
     if hidden_count > 0:
-        st.caption(f"ℹ️ {hidden_count} patient(s) hidden because they are already assigned to a doctor with the same specialty.")
+        st.caption(f"ℹ️ {hidden_count} patient(s) hidden due to already having a doctor assigned in same specialty.")
+
     if not triage_for_me.empty:
         with st.expander("🔎 Filter", expanded=False):
             name_q = st.text_input("Patient name contains…")
-            sev = st.multiselect("Severity", ["mild","moderate","serious"])
+            sev = st.multiselect("Severity", ["mild", "moderate", "serious"])
             df = triage_for_me.copy()
-            if name_q: df = df[df["full_name"].str.contains(name_q, case=False, na=False)]
-            if sev: df = df[df["severity"].isin(sev)]
-        st.dataframe(df if 'df' in locals() else triage_for_me, use_container_width=True, hide_index=True)
+            if name_q:
+                df = df[df["full_name"].str.contains(name_q, case=False, na=False)]
+            if sev:
+                df = df[df["severity"].isin(sev)]
+
+        st.dataframe(df if "df" in locals() else triage_for_me,
+                     use_container_width=True, hide_index=True)
     else:
         st.info("No routed patients available to you right now.")
 
+    # ----------------------
+    # Assignment UI
+    # ----------------------
     st.divider()
     st.subheader("📅 Assign Meeting (Approval)")
+
     if triage_for_me.empty:
         st.caption("No eligible patients to schedule.")
     else:
-        pat_opts = (triage_for_me[["patient_id","full_name"]]
-                    .drop_duplicates()
-                    .sort_values("full_name"))
-        pat_display = {int(r["patient_id"]): r["full_name"] for _, r in pat_opts.iterrows()}
+        pat_opts = (
+            triage_for_me[["patient_id", "full_name"]]
+            .drop_duplicates()
+            .sort_values("full_name")
+        )
+
+        # ⚠️ DO NOT CONVERT patient_id TO INT
+        pat_display = {str(r["patient_id"]): r["full_name"] for _, r in pat_opts.iterrows()}
+
         colA, colB = st.columns(2)
         with colA:
-            chosen_pid = st.selectbox("Select patient", options=list(pat_display.keys()),
-                                      format_func=lambda pid: f"{pat_display[pid]} (#{pid})")
+            chosen_pid = st.selectbox(
+                "Select patient",
+                options=list(pat_display.keys()),
+                format_func=lambda pid: f"{pat_display[pid]}"
+            )
+
         with colB:
             meet_date = st.date_input("Meeting date", value=date.today())
             meet_time = st.time_input("Meeting time", value=time(10, 0))
+
         note = st.text_input("Note (optional)", placeholder="e.g., bring previous reports")
+
         if st.button("Assign Meeting", use_container_width=True):
-            if patient_taken_by_specialty(int(chosen_pid), doctor_spec):
-                st.error("This patient has just been assigned to another doctor of the same specialty.")
+            if patient_taken_by_specialty(chosen_pid, doctor_spec):
+                st.error("This patient has already been assigned to another doctor of the same specialty.")
             else:
                 meeting_dt = datetime.combine(meet_date, meet_time)
-                create_appointment(patient_id=int(chosen_pid), doctor_id=doctor_id, meeting_iso=meeting_dt.isoformat(), note=note.strip())
-                st.success("Meeting assigned! Patient will see it as Date of Approval.")
+                create_appointment(
+                    patient_id=chosen_pid,
+                    doctor_id=doctor_id,
+                    when_dt=meeting_dt,
+                    notes=note.strip()
+                )
+                st.success("Meeting assigned! Patient will see this as Date of Approval.")
                 st.toast("Appointment saved", icon="📅")
                 st.rerun()
 
+    # ----------------------
+    # Notes Viewer
+    # ----------------------
     st.divider()
-    st.subheader("📋 Patient Notes (free text) — routed to your specialty only (and not already taken)")
+    st.subheader("📋 Patient Notes (free text) — only your routed patients")
+
     notes_df = get_all_symptom_records_df()
     if not notes_df.empty and not triage_for_me.empty:
-        my_pat_ids = set(triage_for_me["patient_id"].tolist())
-        notes_df = notes_df[ notes_df["patient_id"].isin(my_pat_ids) ].copy()
+        allowed_ids = set(triage_for_me["patient_id"].astype(str))
+        notes_df["patient_id"] = notes_df["patient_id"].astype(str)
+        notes_df = notes_df[notes_df["patient_id"].isin(allowed_ids)].copy()
     else:
         notes_df = pd.DataFrame()
+
     if not notes_df.empty:
-        st.dataframe(notes_df.drop(columns=["patient_id"]), use_container_width=True, hide_index=True)
+        st.dataframe(
+            notes_df.drop(columns=["patient_id"]),
+            use_container_width=True,
+            hide_index=True
+        )
         st.download_button(
             label="📥 Download Notes (CSV)",
             data=notes_df.drop(columns=["patient_id"]).to_csv(index=False),
@@ -1132,6 +1224,7 @@ def doctor_dashboard():
         )
     else:
         st.caption("No notes for your routed patients yet.")
+
 
 # ==============================
 # MAIN & SESSION
