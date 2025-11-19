@@ -446,22 +446,132 @@ def get_patient_appointments(patient_id: int) -> pd.DataFrame:
             pass
     return df
 
-def get_latest_appointment(patient_id: int):
-    a = appointments_coll.find_one({"patient_id": str(patient_id)}, sort=[("meeting_at", -1)])
-    if not a:
+# Helper: try to convert an id-like value into ObjectId or int when possible
+def _normalize_id_for_query(val):
+    """
+    Return a value suitable for querying Mongo:
+    - If it's an ObjectId string -> ObjectId(...)
+    - If it's an int or numeric string -> int(...)
+    - Otherwise return str(val)
+    """
+    if val is None:
         return None
-    ad = serialize_doc(a)
-    doc = doctors_coll.find_one({"_id": ObjectId(ad.get("doctor_id"))}) if ad.get("doctor_id") and ObjectId.is_valid(ad.get("doctor_id")) else doctors_coll.find_one({"user_id": ad.get("doctor_id")})
-    return (str(ad.get("_id")), ad.get("meeting_at"), ad.get("note"), ad.get("created_at"),
-            doc.get("full_name") if doc else None, doc.get("specialization") if doc else None, doc.get("hospital_clinic") if doc else None)
+    # already an ObjectId
+    if isinstance(val, ObjectId):
+        return val
+    # string that might be an ObjectId
+    if isinstance(val, str):
+        if ObjectId.is_valid(val):
+            try:
+                return ObjectId(val)
+            except Exception:
+                pass
+        # numeric string?
+        if val.isdigit():
+            try:
+                return int(val)
+            except Exception:
+                pass
+        return val  # keep string
+    # int-like
+    if isinstance(val, (int,)):
+        return val
+    # fallback to str
+    return str(val)
 
-def patient_taken_by_specialty(patient_id: int, specialty: str) -> bool:
-    appt = get_latest_appointment(patient_id)
+
+def get_latest_appointment(patient_id):
+    """
+    Returns the latest appointment document (serialized) for the given patient_id.
+    Works whether patient_id is an ObjectId string, ObjectId, numeric id or string id.
+    """
+    # Build possible query candidates:
+    norm = _normalize_id_for_query(patient_id)
+
+    # Try querying by possible stored forms:
+    query_variants = [
+        {"patient_id": norm},
+        {"patient_id": str(patient_id)},
+    ]
+
+    # Also check if some migrated data kept numeric 'patient_id' field (int)
+    if isinstance(norm, int):
+        query_variants.insert(0, {"patient_id": norm})
+    # try each variant until we find an appointment
+    appt = None
+    for q in query_variants:
+        appt = appointments_coll.find_one(q, sort=[("when", -1)]) or appointments_coll.find_one(q, sort=[("meeting_at", -1)])
+        if appt:
+            break
+
     if not appt:
+        return None
+
+    # enrich the appointment with doctor info where possible
+    doc_id = appt.get("doctor_id")
+    normalized_doc_id = _normalize_id_for_query(doc_id)
+    doctor = None
+    if normalized_doc_id is not None:
+        # try _id match
+        doctor = doctors_coll.find_one({"_id": normalized_doc_id}) or doctors_coll.find_one({"id": normalized_doc_id}) \
+                 or doctors_coll.find_one({"user_id": normalized_doc_id})
+    # fallback: try string doctor name/id fields
+    if not doctor and doc_id is not None:
+        doctor = doctors_coll.find_one({"_id": _normalize_id_for_query(str(doc_id))}) or doctors_coll.find_one({"user_id": str(doc_id)})
+
+    # build return value similar to previous SQLite tuple shape where possible
+    # We'll return a dict for safety
+    out = serialize_doc(appt)
+    if doctor:
+        out["doctor_name"] = doctor.get("full_name") or doctor.get("name") or doctor.get("doctor_name")
+        out["doctor_specialization"] = doctor.get("specialization") or doctor.get("speciality") or doctor.get("specialty")
+    return out
+
+
+def patient_taken_by_specialty(patient_id, specialty) -> bool:
+    """
+    Returns True if the patient's latest appointment is with a doctor
+    whose specialization matches `specialty` (case-insensitive substring tolerant).
+    Works with ObjectId/string/int patient ids stored in Mongo.
+    """
+    if not specialty:
         return False
-    latest_spec = (appt[5] or "").strip().lower()
+
+    # find patient's latest appointment robustly
+    latest = get_latest_appointment(patient_id)
+    if not latest:
+        return False
+
+    # doctor id may be stored in different fields in the appointment doc,
+    # ensure we handle ObjectId strings or numeric ids.
+    appt_doc = latest  # already serialized dict
+
+    # get specialization from doctor details if present
+    doc_spec = None
+    if "doctor_specialization" in appt_doc and appt_doc["doctor_specialization"]:
+        doc_spec = appt_doc["doctor_specialization"]
+    else:
+        # try to fetch doctor by id from the original appt doc (appointments_coll contains original)
+        try:
+            raw_appt = appointments_coll.find_one({"_id": _normalize_id_for_query(appt_doc.get("_id"))})
+            if raw_appt:
+                d_id = raw_appt.get("doctor_id")
+                if d_id is not None:
+                    d_normal = _normalize_id_for_query(d_id)
+                    doctor = doctors_coll.find_one({"_id": d_normal}) or doctors_coll.find_one({"id": d_normal}) or doctors_coll.find_one({"user_id": d_normal}) \
+                             or doctors_coll.find_one({"_id": _normalize_id_for_query(str(d_id))})
+                    if doctor:
+                        doc_spec = doctor.get("specialization") or doctor.get("speciality") or doctor.get("specialty")
+        except Exception:
+            doc_spec = None
+
+    latest_spec = (doc_spec or "").strip().lower()
     my_spec = (specialty or "").strip().lower()
+    if not latest_spec or not my_spec:
+        return False
+
     return (my_spec in latest_spec) or (latest_spec in my_spec)
+
 
 def add_note(patient_id, doctor_id, note):
     doc = {
