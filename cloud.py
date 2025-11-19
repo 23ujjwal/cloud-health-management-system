@@ -447,6 +447,7 @@ def get_patient_appointments(patient_id: int) -> pd.DataFrame:
     return df
 
 # Helper: try to convert an id-like value into ObjectId or int when possible
+# Helper: try to convert an id-like value into ObjectId or int when possible
 def _normalize_id_for_query(val):
     """
     Return a value suitable for querying Mongo:
@@ -456,27 +457,22 @@ def _normalize_id_for_query(val):
     """
     if val is None:
         return None
-    # already an ObjectId
     if isinstance(val, ObjectId):
         return val
-    # string that might be an ObjectId
     if isinstance(val, str):
         if ObjectId.is_valid(val):
             try:
                 return ObjectId(val)
             except Exception:
                 pass
-        # numeric string?
         if val.isdigit():
             try:
                 return int(val)
             except Exception:
                 pass
-        return val  # keep string
-    # int-like
+        return val
     if isinstance(val, (int,)):
         return val
-    # fallback to str
     return str(val)
 
 
@@ -485,19 +481,15 @@ def get_latest_appointment(patient_id):
     Returns the latest appointment document (serialized) for the given patient_id.
     Works whether patient_id is an ObjectId string, ObjectId, numeric id or string id.
     """
-    # Build possible query candidates:
     norm = _normalize_id_for_query(patient_id)
 
     # Try querying by possible stored forms:
-    query_variants = [
-        {"patient_id": norm},
-        {"patient_id": str(patient_id)},
-    ]
+    query_variants = []
+    if norm is not None:
+        query_variants.append({"patient_id": norm})
+    query_variants.append({"patient_id": str(patient_id)})
+    # If numeric string converted to int, already handled above
 
-    # Also check if some migrated data kept numeric 'patient_id' field (int)
-    if isinstance(norm, int):
-        query_variants.insert(0, {"patient_id": norm})
-    # try each variant until we find an appointment
     appt = None
     for q in query_variants:
         appt = appointments_coll.find_one(q, sort=[("when", -1)]) or appointments_coll.find_one(q, sort=[("meeting_at", -1)])
@@ -507,20 +499,15 @@ def get_latest_appointment(patient_id):
     if not appt:
         return None
 
-    # enrich the appointment with doctor info where possible
+    # enrich appointment with doctor info where possible
     doc_id = appt.get("doctor_id")
     normalized_doc_id = _normalize_id_for_query(doc_id)
     doctor = None
     if normalized_doc_id is not None:
-        # try _id match
-        doctor = doctors_coll.find_one({"_id": normalized_doc_id}) or doctors_coll.find_one({"id": normalized_doc_id}) \
-                 or doctors_coll.find_one({"user_id": normalized_doc_id})
-    # fallback: try string doctor name/id fields
+        doctor = doctors_coll.find_one({"_id": normalized_doc_id}) or doctors_coll.find_one({"id": normalized_doc_id}) or doctors_coll.find_one({"user_id": normalized_doc_id})
     if not doctor and doc_id is not None:
         doctor = doctors_coll.find_one({"_id": _normalize_id_for_query(str(doc_id))}) or doctors_coll.find_one({"user_id": str(doc_id)})
 
-    # build return value similar to previous SQLite tuple shape where possible
-    # We'll return a dict for safety
     out = serialize_doc(appt)
     if doctor:
         out["doctor_name"] = doctor.get("full_name") or doctor.get("name") or doctor.get("doctor_name")
@@ -537,29 +524,23 @@ def patient_taken_by_specialty(patient_id, specialty) -> bool:
     if not specialty:
         return False
 
-    # find patient's latest appointment robustly
     latest = get_latest_appointment(patient_id)
     if not latest:
         return False
 
-    # doctor id may be stored in different fields in the appointment doc,
-    # ensure we handle ObjectId strings or numeric ids.
-    appt_doc = latest  # already serialized dict
-
     # get specialization from doctor details if present
     doc_spec = None
-    if "doctor_specialization" in appt_doc and appt_doc["doctor_specialization"]:
-        doc_spec = appt_doc["doctor_specialization"]
+    if "doctor_specialization" in latest and latest["doctor_specialization"]:
+        doc_spec = latest["doctor_specialization"]
     else:
-        # try to fetch doctor by id from the original appt doc (appointments_coll contains original)
+        # attempt to find doctor from raw appointment doc
         try:
-            raw_appt = appointments_coll.find_one({"_id": _normalize_id_for_query(appt_doc.get("_id"))})
+            raw_appt = appointments_coll.find_one({"_id": _normalize_id_for_query(latest.get("_id"))})
             if raw_appt:
                 d_id = raw_appt.get("doctor_id")
                 if d_id is not None:
                     d_normal = _normalize_id_for_query(d_id)
-                    doctor = doctors_coll.find_one({"_id": d_normal}) or doctors_coll.find_one({"id": d_normal}) or doctors_coll.find_one({"user_id": d_normal}) \
-                             or doctors_coll.find_one({"_id": _normalize_id_for_query(str(d_id))})
+                    doctor = doctors_coll.find_one({"_id": d_normal}) or doctors_coll.find_one({"id": d_normal}) or doctors_coll.find_one({"user_id": d_normal}) or doctors_coll.find_one({"_id": _normalize_id_for_query(str(d_id))})
                     if doctor:
                         doc_spec = doctor.get("specialization") or doctor.get("speciality") or doctor.get("specialty")
         except Exception:
@@ -569,9 +550,7 @@ def patient_taken_by_specialty(patient_id, specialty) -> bool:
     my_spec = (specialty or "").strip().lower()
     if not latest_spec or not my_spec:
         return False
-
     return (my_spec in latest_spec) or (latest_spec in my_spec)
-
 
 def add_note(patient_id, doctor_id, note):
     doc = {
@@ -1079,8 +1058,14 @@ def doctor_dashboard():
         routed = pd.DataFrame()
 
     if not routed.empty:
-        def _is_taken(pid: int) -> bool:
-            return patient_taken_by_specialty(int(pid), doctor_spec)
+        def _is_taken(pid) -> bool:
+    # pid may be an ObjectId string, ObjectId, int or plain string.
+    # Do NOT convert to int unconditionally.
+    try:
+        return patient_taken_by_specialty(pid, doctor_spec)
+    except Exception:
+        # safe fallback: treat as not taken if anything goes wrong
+        return False
         routed["taken_same_spec"] = routed["patient_id"].apply(_is_taken)
         triage_for_me = routed[~routed["taken_same_spec"]].drop(columns=["taken_same_spec"]).copy()
         hidden_count = int(routed["taken_same_spec"].sum())
