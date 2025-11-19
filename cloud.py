@@ -1,5 +1,5 @@
 # cloud.py
-# Full MongoDB-backed Streamlit app (Health Management System)
+# Full MongoDB-backed Streamlit ap (Health Management System)
 # ------------------------------
 import streamlit as st
 import hashlib
