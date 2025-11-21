@@ -1,6 +1,4 @@
-# cloud.py
-# Full MongoDB-backed Streamlit ap (Health Management System)
-# ------------------------------
+
 import streamlit as st
 import hashlib
 import json
@@ -13,7 +11,7 @@ from dotenv import load_dotenv
 # Load environment
 load_dotenv()
 
-# ---------- BEGIN: MongoDB adapter ----------
+
 from bson import ObjectId
 from bson.json_util import dumps as bson_dumps
 import pymongo
@@ -259,12 +257,7 @@ def get_report_file(file_id):
     except Exception:
         return None, None
 
-# ---------- END: MongoDB adapter ----------
 
-
-# ==============================
-# THEME & STYLES
-# ==============================
 THEMES = {
     "Azure": {
         "--primary": "#3B82F6",
